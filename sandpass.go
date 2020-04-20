@@ -23,9 +23,11 @@ import (
 	"io"
 	"io/ioutil"
 	"log"
+	"mime"
 	"net/http"
 	"net/url"
 	"os"
+	slashpath "path"
 	"path/filepath"
 	"sort"
 	"strconv"
@@ -43,7 +45,6 @@ var (
 	listen       = flag.String("listen", "[::]:8080", "address to listen on")
 	dbPath       = flag.String("db", "", "path to database")
 	templatesDir = flag.String("templates_dir", "templates", "path to template directory")
-	sessionGC    = flag.Duration("session_gc", 1*time.Minute, "frequency at which sessions are to be cleared from memory after expiring")
 )
 
 // Read-only globals
@@ -61,8 +62,8 @@ var (
 
 func main() {
 	flag.Parse()
-	if *dbPath == "" {
-		log.Println("must specify -db")
+	if *dbPath == "" || sessions.keyPath == "" {
+		log.Println("must specify -db and -session_key")
 		os.Exit(1)
 	}
 
@@ -76,7 +77,6 @@ func main() {
 		os.Exit(1)
 	}
 	initHandlers()
-	go gcSessions()
 	if err := http.ListenAndServe(*listen, nil); err != nil {
 		log.Println("listen:", err)
 		os.Exit(1)
@@ -129,6 +129,10 @@ func initHandlers() {
 	rEntry.Handle("/edit", appHandler{f: postEntryForm, perm: "write"}).Methods("GET").Name("editEntryForm")
 	rEntry.Handle("/delete", appHandler{f: confirmDeleteEntry, perm: "write"}).Methods("GET").Name("confirmDeleteEntry")
 	rEntry.Handle("/delete", appHandler{f: deleteEntry, perm: "write"}).Methods("POST").Name("deleteEntry")
+	rEntry.Handle("/attachment", appHandler{f: downloadAttachment}).Methods("GET", "HEAD").Name("downloadAttachment")
+	rEntry.Handle("/attachment", appHandler{f: deleteAttachment, perm: "write"}).Methods("DELETE")
+	rEntry.Handle("/attachment/delete", appHandler{f: confirmDeleteAttachment, perm: "write"}).Methods("GET", "HEAD").Name("confirmDeleteAttachment")
+	rEntry.Handle("/attachment/delete", appHandler{f: deleteAttachment, perm: "write"}).Methods("POST").Name("deleteAttachment")
 
 	meta := r.PathPrefix("/_").Subrouter()
 	meta.Handle("/newdb", appHandler{f: newDB, perm: "init"}).Methods("POST").Name("newDB")
@@ -154,19 +158,6 @@ func initHandlers() {
 
 	http.Handle("/", r)
 	router = r
-}
-
-func gcSessions() {
-	tick := time.Tick(*sessionGC)
-	for {
-		<-tick
-		mu.Lock()
-		n := sessions.clearInvalid()
-		mu.Unlock()
-		if n > 0 {
-			log.Printf("cleared %d invalid sessions", n)
-		}
-	}
 }
 
 func requestGroup(db *keepass.Database, vars map[string]string) (*keepass.Group, error) {
@@ -304,6 +295,32 @@ func viewEntry(w http.ResponseWriter, r *http.Request) error {
 	})
 }
 
+func downloadAttachment(w http.ResponseWriter, r *http.Request) error {
+	mu.Lock()
+	defer mu.Unlock()
+	db, err := sessions.dbFromRequest(w, r)
+	if err != nil {
+		return err
+	}
+	e, err := requestEntry(db, mux.Vars(r))
+	if err != nil {
+		return err
+	}
+	if !e.HasAttachment() {
+		return notFoundError{}
+	}
+	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%q", e.Attachment.Name))
+	w.Header().Set("Content-Length", strconv.Itoa(len(e.Attachment.Data)))
+	contentType := mime.TypeByExtension(slashpath.Ext(e.Attachment.Name))
+	if contentType == "" {
+		// http.DetectContentType always returns a valid MIME type.
+		contentType = http.DetectContentType(e.Attachment.Data)
+	}
+	w.Header().Set("Content-Type", contentType)
+	_, err = w.Write(e.Attachment.Data)
+	return err
+}
+
 func postEntryForm(w http.ResponseWriter, r *http.Request) error {
 	xtok, err := xsrfToken(w, r)
 	if err != nil {
@@ -347,6 +364,9 @@ func postEntryForm(w http.ResponseWriter, r *http.Request) error {
 
 func postEntry(w http.ResponseWriter, r *http.Request) error {
 	now := time.Now()
+	if err := parseMultipartForm(r); err != nil {
+		return err
+	}
 	mu.Lock()
 	defer mu.Unlock()
 	var e *keepass.Entry
@@ -378,7 +398,67 @@ func postEntry(w http.ResponseWriter, r *http.Request) error {
 		e.Username = r.FormValue("username")
 		e.Password = r.FormValue("password")
 		e.URL = r.FormValue("url")
+		if f, header, err := r.FormFile("attachment"); err == nil {
+			e.Attachment.Name = header.Filename
+			e.Attachment.Data, err = ioutil.ReadAll(f)
+			if err != nil {
+				return err
+			}
+		} else if err != http.ErrMissingFile {
+			return err
+		}
 		e.Notes = r.FormValue("notes")
+		e.LastModificationTime = now
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	return redirectRoute(w, r, "viewEntry", "uuid", e.UUID.String())
+}
+
+func confirmDeleteAttachment(w http.ResponseWriter, r *http.Request) error {
+	xtok, err := xsrfToken(w, r)
+	if err != nil {
+		return err
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	db, err := sessions.dbFromRequest(w, r)
+	if err != nil {
+		return err
+	}
+	e, err := requestEntry(db, mux.Vars(r))
+	if err != nil {
+		return err
+	}
+	return tmpl.ExecuteTemplate(w, "deleteattachment.html", struct {
+		Entry     *keepass.Entry
+		Group     *keepass.Group
+		XSRFToken string
+	}{
+		Entry:     e,
+		Group:     e.Parent(),
+		XSRFToken: xtok,
+	})
+}
+
+func deleteAttachment(w http.ResponseWriter, r *http.Request) error {
+	now := time.Now()
+	mu.Lock()
+	defer mu.Unlock()
+	var e *keepass.Entry
+	err := transaction(w, r, func(db *keepass.Database) error {
+		var err error
+		e, err = requestEntry(db, mux.Vars(r))
+		if err != nil {
+			return err
+		}
+		if !e.HasAttachment() {
+			return notFoundError{}
+		}
+		e.Attachment.Name = ""
+		e.Attachment.Data = nil
 		e.LastModificationTime = now
 		return nil
 	})
@@ -578,7 +658,9 @@ func nuke(w http.ResponseWriter, r *http.Request) error {
 	if err := dbStorage.remove(); err != nil {
 		return err
 	}
-	sessions.clear()
+	if err := sessions.invalidateAll(); err != nil {
+		return err
+	}
 	return redirectRoute(w, r, "root")
 }
 
@@ -621,9 +703,12 @@ func newDB(w http.ResponseWriter, r *http.Request) error {
 		return err
 	}
 
-	sessions.new(w, sessionData{
-		key: db.ComputedKey(),
+	_, err = sessions.new(w, sessionData{
+		Key: db.ComputedKey(),
 	})
+	if err != nil {
+		return err
+	}
 	return redirectRoute(w, r, "listGroups")
 }
 
@@ -698,9 +783,12 @@ func startSession(w http.ResponseWriter, r *http.Request) error {
 		return err
 	}
 
-	sessions.new(w, sessionData{
-		key: db.ComputedKey(),
+	_, err = sessions.new(w, sessionData{
+		Key: db.ComputedKey(),
 	})
+	if err != nil {
+		return err
+	}
 	return redirectRoute(w, r, "listGroups")
 }
 

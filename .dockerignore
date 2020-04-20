@@ -1,0 +1,20 @@
+/Dockerfile
+/sandpass
+*.spk
+/.sandstorm/
+/sandstorm-pkgdef.capnp
+.git/
+.gitignore
+
+# Go
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Test binary
+*.test
+
+# Output of the go coverage tool
+*.out
